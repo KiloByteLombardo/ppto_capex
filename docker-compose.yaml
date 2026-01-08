@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  ppto-capex-vzla:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ppto-capex-vzla
+    ports:
+      - "9777:9777"
+    environment:
+      - GCP_PROJECT_ID=${GCP_PROJECT_ID}
+      - GCS_BUCKET_NAME=${GCS_BUCKET_NAME}
+      - BQ_DATASET=${BQ_DATASET}
+      - BQ_TABLE=${BQ_TABLE}
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # Montar código fuente para desarrollo
+      - ./src:/app/src:ro
+      # Montar credenciales si existen
+      - ./credentials.json:/app/credentials.json:ro
+      # Montar carpeta de resultados
+      - ./resultados:/app/resultados
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9777/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
