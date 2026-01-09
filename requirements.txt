@@ -1,6 +1,7 @@
 # Core
 flask==3.0.0
 gunicorn==21.2.0
+requests==2.31.0
 
 # Data Processing
 pandas==2.1.4
