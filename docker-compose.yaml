@@ -10,8 +10,9 @@ services:
     environment:
       - GCP_PROJECT_ID=${GCP_PROJECT_ID}
       - GCS_BUCKET_NAME=${GCS_BUCKET_NAME}
-      - BQ_DATASET=${BQ_DATASET}
-      - BQ_TABLE=${BQ_TABLE}
+      - BIGQUERY_DATASET=${BIGQUERY_DATASET}
+      - BIGQUERY_TABLE=${BIGQUERY_TABLE}
+      - GOOGLE_SHEET_ID=${GOOGLE_SHEET_ID}
       - PYTHONUNBUFFERED=1
     volumes:
       # Montar código fuente para desarrollo
