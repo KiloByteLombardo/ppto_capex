@@ -12,6 +12,9 @@ from datetime import datetime
 import os
 import json
 
+# Importar funciones de tasa de cambio
+from tasa import obtener_tasa_bolivar_dolar
+
 # Configuración de carpeta de resultados
 RESULTADOS_PATH = Path(__file__).parent.parent / 'resultados'
 
@@ -56,6 +59,13 @@ PRIORIDADES_USD_CUENTA_ORIGINAL = [69, 70, 71, 72, 73, 74, 75, 76, 77, 87, 86, 8
 
 # Cuenta por defecto cuando USD no está en las prioridades especiales
 CUENTA_USD_DEFAULT = "1111"
+
+# Prioridades que mantienen el monto original sin conversión (para Monto Final)
+# Si la prioridad está en este array, el monto no se multiplica por la tasa
+PRIORIDADES_MONTO_SIN_CONVERSION = [67, 69, 70, 71, 72, 73, 74, 75, 76, 77, 87, 86, 88, 83, 84, 85, 89]
+
+# Margen adicional para tasa de día JUEVES (tasa + 5)
+MARGEN_TASA_JUEVES = 5
 
 
 class ResultadoThread:
@@ -294,6 +304,135 @@ def calcular_columnas_adicionales(df: pd.DataFrame) -> pd.DataFrame:
     ]
     print(f"[THREAD-DF] Columna 'Dia de Pago' calculada")
     
+    # ========================================================================
+    # OBTENER TASA DE CAMBIO VES/USD
+    # ========================================================================
+    print("[THREAD-DF] Obteniendo tasa de cambio VES/USD...")
+    tasa_info = obtener_tasa_bolivar_dolar()
+    
+    if tasa_info['success'] and tasa_info['tasa']:
+        tasa_ves_usd = float(tasa_info['tasa'])
+        tasa_ves_usd_mas_5 = tasa_ves_usd + MARGEN_TASA_JUEVES
+        print(f"[THREAD-DF] Tasa VES/USD: {tasa_ves_usd}, Tasa + 5: {tasa_ves_usd_mas_5}")
+    else:
+        # Tasa por defecto si falla la consulta
+        tasa_ves_usd = 36.50
+        tasa_ves_usd_mas_5 = 41.50
+        print(f"[THREAD-DF] WARN: Usando tasa por defecto: {tasa_ves_usd}")
+    
+    # Obtener columnas necesarias para Monto Final
+    monto = pd.to_numeric(df_result.get('Monto', pd.Series([0] * len(df_result))), errors='coerce').fillna(0)
+    capex_ext = pd.to_numeric(df_result.get('Monto CAPEX EXT', pd.Series([0] * len(df_result))), errors='coerce').fillna(0)
+    capex_ord = pd.to_numeric(df_result.get('Monto CAPEX ORD', pd.Series([0] * len(df_result))), errors='coerce').fillna(0)
+    cadm = pd.to_numeric(df_result.get('Monto CADM', pd.Series([0] * len(df_result))), errors='coerce').fillna(0)
+    
+    # ========================================================================
+    # COLUMNA 4: Monto Final
+    # Lógica:
+    # - Si Moneda = "VES" → Monto
+    # - Si Prioridad está en PRIORIDADES_MONTO_SIN_CONVERSION → Monto
+    # - Si Dia de Pago = "JUEVES" → Monto * tasa_ves_usd_mas_5
+    # - Sino → Monto * tasa_ves_usd
+    # ========================================================================
+    def calcular_monto_final(row_moneda, row_prioridad, row_monto, row_dia_pago):
+        if pd.isna(row_monto) or row_monto == 0:
+            return 0
+        
+        row_moneda = str(row_moneda).strip().upper() if pd.notna(row_moneda) else ''
+        row_prioridad = int(row_prioridad) if pd.notna(row_prioridad) else 0
+        row_dia_pago = str(row_dia_pago).strip().upper() if pd.notna(row_dia_pago) else 'JUEVES'
+        
+        # Si moneda es VES, no hay conversión
+        if row_moneda == 'VES':
+            return float(row_monto)
+        
+        # Si prioridad está en el array, no hay conversión
+        if row_prioridad in PRIORIDADES_MONTO_SIN_CONVERSION:
+            return float(row_monto)
+        
+        # Aplicar tasa según día de pago
+        if row_dia_pago == 'JUEVES':
+            return float(row_monto) * tasa_ves_usd_mas_5
+        else:
+            return float(row_monto) * tasa_ves_usd
+    
+    df_result['Monto Final'] = [
+        calcular_monto_final(m, p, mto, dp) 
+        for m, p, mto, dp in zip(moneda, prioridad, monto, df_result['Dia de Pago'])
+    ]
+    print(f"[THREAD-DF] Columna 'Monto Final' calculada")
+    
+    # Obtener Monto Final como serie para cálculos siguientes
+    monto_final = pd.to_numeric(df_result['Monto Final'], errors='coerce').fillna(0)
+    
+    # ========================================================================
+    # COLUMNA 5: Monto Capex Final
+    # Lógica:
+    # - Si (CAPEX EXT = 0 Y CAPEX ORD = 0) → 0
+    # - Sino → ((CAPEX EXT + CAPEX ORD) / (CAPEX EXT + CAPEX ORD + CADM)) * Monto Final
+    # ========================================================================
+    def calcular_monto_capex_final(row_capex_ext, row_capex_ord, row_cadm, row_monto_final):
+        capex_ext_val = float(row_capex_ext) if pd.notna(row_capex_ext) else 0
+        capex_ord_val = float(row_capex_ord) if pd.notna(row_capex_ord) else 0
+        cadm_val = float(row_cadm) if pd.notna(row_cadm) else 0
+        monto_final_val = float(row_monto_final) if pd.notna(row_monto_final) else 0
+        
+        # Si ambos CAPEX son 0, retornar 0
+        if capex_ext_val == 0 and capex_ord_val == 0:
+            return 0
+        
+        # Calcular total
+        total = capex_ext_val + capex_ord_val + cadm_val
+        
+        if total == 0:
+            return 0
+        
+        # Proporción de CAPEX sobre el total
+        proporcion_capex = (capex_ext_val + capex_ord_val) / total
+        return proporcion_capex * monto_final_val
+    
+    df_result['Monto Capex Final'] = [
+        calcular_monto_capex_final(ce, co, ca, mf) 
+        for ce, co, ca, mf in zip(capex_ext, capex_ord, cadm, monto_final)
+    ]
+    print(f"[THREAD-DF] Columna 'Monto Capex Final' calculada")
+    
+    # ========================================================================
+    # COLUMNA 6: Monto Opex Final
+    # Lógica:
+    # - Si (CAPEX EXT = 0 Y CAPEX ORD = 0) → Monto Final
+    # - Sino → (CADM / (CAPEX EXT + CAPEX ORD + CADM)) * Monto Final
+    # ========================================================================
+    def calcular_monto_opex_final(row_capex_ext, row_capex_ord, row_cadm, row_monto_final):
+        capex_ext_val = float(row_capex_ext) if pd.notna(row_capex_ext) else 0
+        capex_ord_val = float(row_capex_ord) if pd.notna(row_capex_ord) else 0
+        cadm_val = float(row_cadm) if pd.notna(row_cadm) else 0
+        monto_final_val = float(row_monto_final) if pd.notna(row_monto_final) else 0
+        
+        # Si ambos CAPEX son 0, retornar Monto Final completo
+        if capex_ext_val == 0 and capex_ord_val == 0:
+            return monto_final_val
+        
+        # Calcular total
+        total = capex_ext_val + capex_ord_val + cadm_val
+        
+        if total == 0:
+            return monto_final_val
+        
+        # Proporción de CADM (OPEX) sobre el total
+        proporcion_opex = cadm_val / total
+        return proporcion_opex * monto_final_val
+    
+    df_result['Monto Opex Final'] = [
+        calcular_monto_opex_final(ce, co, ca, mf) 
+        for ce, co, ca, mf in zip(capex_ext, capex_ord, cadm, monto_final)
+    ]
+    print(f"[THREAD-DF] Columna 'Monto Opex Final' calculada")
+    
+    # Guardar las tasas en el DataFrame para referencia
+    df_result.attrs['tasa_ves_usd'] = tasa_ves_usd
+    df_result.attrs['tasa_ves_usd_mas_5'] = tasa_ves_usd_mas_5
+    
     print(f"[THREAD-DF] Columnas adicionales completadas: {df_result.shape[1]} columnas totales")
     
     return df_result
@@ -516,58 +655,162 @@ def crear_excel_con_formulas(df: pd.DataFrame, output_path: Path) -> Dict[str, A
         print(f"[THREAD-EXCEL] Columna 'Dia de Pago' agregada")
         
         # ====================================================================
-        # COLUMNA 4: Total CAPEX (suma de CAPEX EXT + CAPEX ORD)
+        # CREAR HOJA "Tasa" CON LAS TASAS DE CAMBIO
         # ====================================================================
-        col_total_capex = col_formula_idx
-        col_formula_idx += 1
-        worksheet.write(0, col_total_capex, 'Total CAPEX', header_format)
-        worksheet.set_column(col_total_capex, col_total_capex, 14)
+        # Obtener tasas de cambio
+        tasa_info = obtener_tasa_bolivar_dolar()
+        if tasa_info['success'] and tasa_info['tasa']:
+            tasa_ves_usd = float(tasa_info['tasa'])
+        else:
+            tasa_ves_usd = 50.0  # Tasa por defecto si falla la API
+        tasa_ves_usd_mas_5 = tasa_ves_usd + MARGEN_TASA_JUEVES
         
-        if capex_ext_col is not None and capex_ord_col is not None:
-            capex_ext_letter = indice_a_letra_excel(capex_ext_col)
-            capex_ord_letter = indice_a_letra_excel(capex_ord_col)
-            
+        print(f"[THREAD-EXCEL] Tasa obtenida: VES/USD={tasa_ves_usd}, VES+5={tasa_ves_usd_mas_5}")
+        
+        # Crear hoja "Tasa"
+        ws_tasa = workbook.add_worksheet('Tasa')
+        
+        # Formatos para la hoja Tasa
+        tasa_header_format = workbook.add_format({
+            'bold': True,
+            'bg_color': '#4472C4',
+            'font_color': 'white',
+            'border': 1,
+            'align': 'center',
+            'valign': 'vcenter',
+            'font_size': 12
+        })
+        
+        tasa_value_format = workbook.add_format({
+            'num_format': '#,##0.00',
+            'border': 1,
+            'align': 'center',
+            'font_size': 14,
+            'bold': True
+        })
+        
+        tasa_label_format = workbook.add_format({
+            'border': 1,
+            'align': 'left',
+            'font_size': 11
+        })
+        
+        # Escribir encabezados y valores en hoja Tasa
+        ws_tasa.write(0, 0, 'Descripción', tasa_header_format)
+        ws_tasa.write(0, 1, 'Valor', tasa_header_format)
+        ws_tasa.write(0, 2, 'Fuente', tasa_header_format)
+        
+        # Fila 2: Tasa VES/USD (celda B2)
+        ws_tasa.write(1, 0, 'Tasa VES/USD', tasa_label_format)
+        ws_tasa.write(1, 1, tasa_ves_usd, tasa_value_format)
+        ws_tasa.write(1, 2, tasa_info.get('fuente', 'DolarAPI') if tasa_info['success'] else 'Por defecto', tasa_label_format)
+        
+        # Fila 3: Tasa VES/USD + 5 (celda B3)
+        ws_tasa.write(2, 0, 'Tasa VES/USD + 5', tasa_label_format)
+        ws_tasa.write(2, 1, tasa_ves_usd_mas_5, tasa_value_format)
+        ws_tasa.write(2, 2, 'Calculada (Tasa + 5)', tasa_label_format)
+        
+        # Fila 4: Margen
+        ws_tasa.write(3, 0, 'Margen día JUEVES', tasa_label_format)
+        ws_tasa.write(3, 1, MARGEN_TASA_JUEVES, tasa_value_format)
+        ws_tasa.write(3, 2, 'Configuración', tasa_label_format)
+        
+        # Fila 5: Fecha de consulta
+        ws_tasa.write(4, 0, 'Fecha consulta', tasa_label_format)
+        ws_tasa.write(4, 1, tasa_info.get('fecha', datetime.now().strftime('%Y-%m-%d')), tasa_label_format)
+        ws_tasa.write(4, 2, tasa_info.get('timestamp', ''), tasa_label_format)
+        
+        # Ajustar ancho de columnas
+        ws_tasa.set_column(0, 0, 20)
+        ws_tasa.set_column(1, 1, 15)
+        ws_tasa.set_column(2, 2, 30)
+        
+        print(f"[THREAD-EXCEL] Hoja 'Tasa' creada")
+        
+        # Referencias a las tasas en la hoja Tasa (para usar en fórmulas)
+        # Tasa!$B$2 = Tasa VES/USD
+        # Tasa!$B$3 = Tasa VES/USD + 5
+        tasa_normal_ref = "Tasa!$B$2"
+        tasa_mas_5_ref = "Tasa!$B$3"
+        
+        # Letras necesarias para las fórmulas
+        monto_letter = indice_a_letra_excel(monto_col) if monto_col is not None else None
+        dia_pago_letter = indice_a_letra_excel(col_dia_pago)
+        capex_ext_letter = indice_a_letra_excel(capex_ext_col) if capex_ext_col is not None else None
+        capex_ord_letter = indice_a_letra_excel(capex_ord_col) if capex_ord_col is not None else None
+        cadm_letter = indice_a_letra_excel(cadm_col) if cadm_col is not None else None
+        
+        # ====================================================================
+        # COLUMNA 7: Monto Final
+        # Fórmula: =IF(Moneda="VES",Monto,IF(OR(Prioridad=67,...),Monto,IF(DiaPago="JUEVES",Monto*TasaMas5,Monto*TasaNormal)))
+        # ====================================================================
+        col_monto_final = col_formula_idx
+        col_formula_idx += 1
+        worksheet.write(0, col_monto_final, 'Monto Final', header_format)
+        worksheet.set_column(col_monto_final, col_monto_final, 16)
+        
+        if moneda_letter and prioridad_letter and monto_letter:
             for row in range(1, num_filas + 1):
                 excel_row = row + 1
-                formula = f'=IF(ISNUMBER({capex_ext_letter}{excel_row}),{capex_ext_letter}{excel_row},0)+IF(ISNUMBER({capex_ord_letter}{excel_row}),{capex_ord_letter}{excel_row},0)'
-                worksheet.write_formula(row, col_total_capex, formula, money_format)
+                or_prioridades = generar_formula_or_prioridades(prioridad_letter, PRIORIDADES_MONTO_SIN_CONVERSION, excel_row)
+                formula = (
+                    f'=IF({moneda_letter}{excel_row}="VES",{monto_letter}{excel_row},'
+                    f'IF({or_prioridades},{monto_letter}{excel_row},'
+                    f'IF({dia_pago_letter}{excel_row}="JUEVES",'
+                    f'{monto_letter}{excel_row}*{tasa_mas_5_ref},'
+                    f'{monto_letter}{excel_row}*{tasa_normal_ref})))'
+                )
+                worksheet.write_formula(row, col_monto_final, formula, money_format)
+        
+        monto_final_letter = indice_a_letra_excel(col_monto_final)
+        print(f"[THREAD-EXCEL] Columna 'Monto Final' agregada")
         
         # ====================================================================
-        # COLUMNA 5: Total General (Monto + CAPEX EXT + CAPEX ORD + CADM)
+        # COLUMNA 8: Monto Capex Final
+        # Fórmula: =IF(AND(CAPEX_EXT=0,CAPEX_ORD=0),0,((CAPEX_EXT+CAPEX_ORD)/(CAPEX_EXT+CAPEX_ORD+CADM))*MontoFinal)
         # ====================================================================
-        col_total_general = col_formula_idx
+        col_monto_capex_final = col_formula_idx
         col_formula_idx += 1
-        worksheet.write(0, col_total_general, 'Total General', header_format)
-        worksheet.set_column(col_total_general, col_total_general, 14)
+        worksheet.write(0, col_monto_capex_final, 'Monto Capex Final', header_format)
+        worksheet.set_column(col_monto_capex_final, col_monto_capex_final, 18)
         
-        for row in range(1, num_filas + 1):
-            excel_row = row + 1
-            formula_parts = []
-            for col_name, col_idx in [('Monto', monto_col), ('Monto CAPEX EXT', capex_ext_col), 
-                                       ('Monto CAPEX ORD', capex_ord_col), ('Monto CADM', cadm_col)]:
-                if col_idx is not None:
-                    col_letter = indice_a_letra_excel(col_idx)
-                    formula_parts.append(f'IF(ISNUMBER({col_letter}{excel_row}),{col_letter}{excel_row},0)')
-            
-            if formula_parts:
-                formula = '=' + '+'.join(formula_parts)
-                worksheet.write_formula(row, col_total_general, formula, money_format)
-        
-        # ====================================================================
-        # COLUMNA 6: Días Vencimiento
-        # ====================================================================
-        if fecha_venc_col is not None:
-            col_dias_venc = col_formula_idx
-            col_formula_idx += 1
-            worksheet.write(0, col_dias_venc, 'Días Vencimiento', header_format)
-            worksheet.set_column(col_dias_venc, col_dias_venc, 16)
-            
-            fecha_venc_letter = indice_a_letra_excel(fecha_venc_col)
-            
+        if capex_ext_letter and capex_ord_letter and cadm_letter:
             for row in range(1, num_filas + 1):
                 excel_row = row + 1
-                formula = f'=IF(ISNUMBER({fecha_venc_letter}{excel_row}),TODAY()-{fecha_venc_letter}{excel_row},"")'
-                worksheet.write_formula(row, col_dias_venc, formula, text_format)
+                formula = (
+                    f'=IF(AND({capex_ext_letter}{excel_row}=0,{capex_ord_letter}{excel_row}=0),0,'
+                    f'(({capex_ext_letter}{excel_row}+{capex_ord_letter}{excel_row})/'
+                    f'({capex_ext_letter}{excel_row}+{capex_ord_letter}{excel_row}+{cadm_letter}{excel_row}))'
+                    f'*{monto_final_letter}{excel_row})'
+                )
+                worksheet.write_formula(row, col_monto_capex_final, formula, money_format)
+        
+        monto_capex_final_letter = indice_a_letra_excel(col_monto_capex_final)
+        print(f"[THREAD-EXCEL] Columna 'Monto Capex Final' agregada")
+        
+        # ====================================================================
+        # COLUMNA 9: Monto Opex Final
+        # Fórmula: =IF(AND(CAPEX_EXT=0,CAPEX_ORD=0),MontoFinal,(CADM/(CAPEX_EXT+CAPEX_ORD+CADM))*MontoFinal)
+        # ====================================================================
+        col_monto_opex_final = col_formula_idx
+        col_formula_idx += 1
+        worksheet.write(0, col_monto_opex_final, 'Monto Opex Final', header_format)
+        worksheet.set_column(col_monto_opex_final, col_monto_opex_final, 18)
+        
+        if capex_ext_letter and capex_ord_letter and cadm_letter:
+            for row in range(1, num_filas + 1):
+                excel_row = row + 1
+                formula = (
+                    f'=IF(AND({capex_ext_letter}{excel_row}=0,{capex_ord_letter}{excel_row}=0),'
+                    f'{monto_final_letter}{excel_row},'
+                    f'({cadm_letter}{excel_row}/'
+                    f'({capex_ext_letter}{excel_row}+{capex_ord_letter}{excel_row}+{cadm_letter}{excel_row}))'
+                    f'*{monto_final_letter}{excel_row})'
+                )
+                worksheet.write_formula(row, col_monto_opex_final, formula, money_format)
+        
+        monto_opex_final_letter = indice_a_letra_excel(col_monto_opex_final)
+        print(f"[THREAD-EXCEL] Columna 'Monto Opex Final' agregada")
         
         # ====================================================================
         # FILA DE TOTALES
@@ -584,15 +827,15 @@ def crear_excel_con_formulas(df: pd.DataFrame, output_path: Path) -> Dict[str, A
                 formula = f'=SUM({col_letter}2:{col_letter}{num_filas + 1})'
                 worksheet.write_formula(fila_totales, col_idx, formula, formula_format)
         
-        # Suma para columnas de fórmula (Total CAPEX y Total General)
-        total_capex_letter = indice_a_letra_excel(col_total_capex)
-        total_general_letter = indice_a_letra_excel(col_total_general)
-        
-        worksheet.write_formula(fila_totales, col_total_capex, 
-                               f'=SUM({total_capex_letter}2:{total_capex_letter}{num_filas + 1})', 
+        # Suma para nuevas columnas (Monto Final, Monto Capex Final, Monto Opex Final)
+        worksheet.write_formula(fila_totales, col_monto_final, 
+                               f'=SUM({monto_final_letter}2:{monto_final_letter}{num_filas + 1})', 
                                formula_format)
-        worksheet.write_formula(fila_totales, col_total_general, 
-                               f'=SUM({total_general_letter}2:{total_general_letter}{num_filas + 1})', 
+        worksheet.write_formula(fila_totales, col_monto_capex_final, 
+                               f'=SUM({monto_capex_final_letter}2:{monto_capex_final_letter}{num_filas + 1})', 
+                               formula_format)
+        worksheet.write_formula(fila_totales, col_monto_opex_final, 
+                               f'=SUM({monto_opex_final_letter}2:{monto_opex_final_letter}{num_filas + 1})', 
                                formula_format)
         
         # Freeze panes (fijar encabezado)
@@ -607,14 +850,19 @@ def crear_excel_con_formulas(df: pd.DataFrame, output_path: Path) -> Dict[str, A
         'filas': num_filas,
         'columnas_originales': num_cols,
         'columnas_con_formulas': col_formula_idx,
+        'tasas': {
+            'tasa_ves_usd': tasa_ves_usd,
+            'tasa_ves_usd_mas_5': tasa_ves_usd_mas_5
+        },
         'columnas_agregadas': [
             'Moneda Pago',
             'Cuenta Bancaria', 
             'Dia de Pago',
-            'Total CAPEX',
-            'Total General',
-            'Días Vencimiento'
-        ]
+            'Monto Final',
+            'Monto Capex Final',
+            'Monto Opex Final'
+        ],
+        'hoja_tasa': 'Tasa'
     }
 
 

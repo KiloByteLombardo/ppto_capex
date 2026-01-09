@@ -60,13 +60,33 @@ def obtener_tasa_bolivar_dolar() -> Dict:
         cotizacion_usar = tasa_bcv or tasa_paralelo or (data[0] if data else None)
         
         if cotizacion_usar:
+            # Obtener el valor de la tasa (puede venir como string "325.39" o número)
+            tasa_promedio = cotizacion_usar.get('promedio', cotizacion_usar.get('compra', 0))
+            tasa_compra = cotizacion_usar.get('compra', 0)
+            tasa_venta = cotizacion_usar.get('venta', 0)
+            
+            # Convertir a float manejando strings
+            def parse_tasa(valor):
+                if valor is None:
+                    return 0.0
+                if isinstance(valor, (int, float)):
+                    return float(valor)
+                if isinstance(valor, str):
+                    # Remover posibles caracteres no numéricos excepto punto y coma
+                    valor = valor.strip().replace(',', '.')
+                    try:
+                        return float(valor)
+                    except ValueError:
+                        return 0.0
+                return 0.0
+            
             resultado = {
                 'success': True,
                 'moneda_origen': 'VES',
                 'moneda_destino': 'USD',
-                'tasa': float(cotizacion_usar.get('promedio', cotizacion_usar.get('compra', 0))),
-                'tasa_compra': float(cotizacion_usar.get('compra', 0)),
-                'tasa_venta': float(cotizacion_usar.get('venta', 0)),
+                'tasa': parse_tasa(tasa_promedio),
+                'tasa_compra': parse_tasa(tasa_compra),
+                'tasa_venta': parse_tasa(tasa_venta),
                 'fuente': cotizacion_usar.get('nombre', 'DolarAPI Venezuela'),
                 'fecha': cotizacion_usar.get('fechaActualizacion', str(datetime.now().date())),
                 'timestamp': datetime.now().isoformat()
