@@ -15,6 +15,9 @@ import json
 # Importar funciones de tasa de cambio
 from tasa import obtener_tasa_bolivar_dolar
 
+# Importar conexión a Google Sheets para tabla de áreas
+from connection import get_google_sheet_data
+
 # Configuración de carpeta de resultados
 RESULTADOS_PATH = Path(__file__).parent.parent / 'resultados'
 
@@ -66,6 +69,24 @@ PRIORIDADES_MONTO_SIN_CONVERSION = [67, 69, 70, 71, 72, 73, 74, 75, 76, 77, 87, 
 
 # Margen adicional para tasa de día JUEVES (tasa + 5)
 MARGEN_TASA_JUEVES = 5
+
+# ============================================================================
+# CONFIGURACIÓN PARA COLUMNA AREA (RECARGAS)
+# ============================================================================
+
+# Proveedores que siempre son RECARGAS
+PROVEEDORES_SIEMPRE_RECARGAS = [
+    "GALAXY ENTERTAINMENT DE VENEZUELA, C.A. (SIMPLE TV )",
+    "RECARGAS MOVIL C.A"
+]
+
+# Proveedores con condiciones de sucursal para ser RECARGAS
+PROVEEDORES_RECARGAS_CONDICIONAL = {
+    "CORPORACION DIGITEL, C.A.": ["POSPAGO FACTURA", "PREPAGO RECARGA"],
+    "NETUNO, C.A.": ["RECARGAS"],
+    "TELEFÓNICA VENEZOLANA, C.A.": ["RECARGAS"],
+    "TELEFONICA VENEZOLANA, C.A.": ["RECARGAS"]  # Sin acento por si acaso
+}
 
 
 class ResultadoThread:
@@ -428,6 +449,227 @@ def calcular_columnas_adicionales(df: pd.DataFrame) -> pd.DataFrame:
         for ce, co, ca, mf in zip(capex_ext, capex_ord, cadm, monto_final)
     ]
     print(f"[THREAD-DF] Columna 'Monto Opex Final' calculada")
+    
+    # ========================================================================
+    # OBTENER TABLA DE ÁREAS DESDE GOOGLE SHEETS
+    # ========================================================================
+    print("[THREAD-DF] Obteniendo tabla de áreas desde Google Sheets...")
+    try:
+        df_areas = get_google_sheet_data()
+        # Crear diccionario para búsqueda rápida (Solicitante -> Area)
+        # Asumiendo que columna A es el código y columna B es el área
+        areas_dict = {}
+        if len(df_areas.columns) >= 2:
+            col_codigo = df_areas.columns[0]
+            col_area = df_areas.columns[1]
+            for _, row in df_areas.iterrows():
+                codigo = row[col_codigo]
+                area = row[col_area]
+                if pd.notna(codigo):
+                    areas_dict[str(codigo).strip()] = str(area).strip() if pd.notna(area) else "SERVICIOS"
+        print(f"[THREAD-DF] Tabla de áreas cargada: {len(areas_dict)} registros")
+    except Exception as e:
+        print(f"[THREAD-DF] WARN: No se pudo cargar tabla de áreas: {str(e)}")
+        df_areas = pd.DataFrame()
+        areas_dict = {}
+    
+    # Guardar df_areas en attrs para usarlo en el Excel
+    df_result.attrs['df_areas'] = df_areas
+    
+    # Obtener columnas necesarias para AREA
+    proveedor = df_result.get('Proveedor', pd.Series([''] * len(df_result)))
+    sucursal = df_result.get('Sucursal', pd.Series([''] * len(df_result)))
+    solicitante = df_result.get('Solicitante', pd.Series([''] * len(df_result)))
+    
+    # Obtener Monto Capex Final y Monto Opex Final para las siguientes columnas
+    monto_capex_final = pd.to_numeric(df_result['Monto Capex Final'], errors='coerce').fillna(0)
+    monto_opex_final = pd.to_numeric(df_result['Monto Opex Final'], errors='coerce').fillna(0)
+    
+    # ========================================================================
+    # COLUMNA 7: AREA
+    # Lógica:
+    # - Si proveedor + sucursal cumplen condiciones de RECARGAS → "RECARGAS"
+    # - Si Solicitante = 0 → "SERVICIOS"
+    # - Si no → BUSCARV en tabla de áreas
+    # ========================================================================
+    def calcular_area(row_proveedor, row_sucursal, row_solicitante):
+        prov = str(row_proveedor).strip().upper() if pd.notna(row_proveedor) else ''
+        suc = str(row_sucursal).strip().upper() if pd.notna(row_sucursal) else ''
+        sol = str(row_solicitante).strip() if pd.notna(row_solicitante) else '0'
+        
+        # Verificar proveedores que siempre son RECARGAS
+        for prov_recarga in PROVEEDORES_SIEMPRE_RECARGAS:
+            if prov_recarga.upper() in prov or prov in prov_recarga.upper():
+                return "RECARGAS"
+        
+        # Verificar proveedores con condiciones de sucursal
+        for prov_cond, sucursales in PROVEEDORES_RECARGAS_CONDICIONAL.items():
+            if prov_cond.upper() in prov or prov in prov_cond.upper():
+                for suc_recarga in sucursales:
+                    if suc_recarga.upper() in suc or suc in suc_recarga.upper():
+                        return "RECARGAS"
+        
+        # Si Solicitante es 0 o vacío → SERVICIOS
+        try:
+            sol_num = float(sol) if sol else 0
+            if sol_num == 0:
+                return "SERVICIOS"
+        except ValueError:
+            pass
+        
+        # Buscar en tabla de áreas
+        if sol in areas_dict:
+            return areas_dict[sol]
+        
+        # Si no se encuentra, retornar SERVICIOS
+        return "SERVICIOS"
+    
+    df_result['AREA'] = [
+        calcular_area(p, s, sol) 
+        for p, s, sol in zip(proveedor, sucursal, solicitante)
+    ]
+    print(f"[THREAD-DF] Columna 'AREA' calculada")
+    
+    # ========================================================================
+    # COLUMNA 8: Tipo Capex 2
+    # Lógica:
+    # - Si AREA = "RECARGAS" → "RECARGAS"
+    # - Si (Monto CAPEX Final <> 0 Y Monto OPEX Final <> 0) → "MIXTA"
+    # - Si Monto CAPEX Final <> 0 → "CAPEX"
+    # - Si no → "OPEX"
+    # ========================================================================
+    def calcular_tipo_capex_2(row_area, row_monto_capex_final, row_monto_opex_final):
+        area = str(row_area).strip().upper() if pd.notna(row_area) else ''
+        mcf = float(row_monto_capex_final) if pd.notna(row_monto_capex_final) else 0
+        mof = float(row_monto_opex_final) if pd.notna(row_monto_opex_final) else 0
+        
+        if area == "RECARGAS":
+            return "RECARGAS"
+        
+        if mcf != 0 and mof != 0:
+            return "MIXTA"
+        
+        if mcf != 0:
+            return "CAPEX"
+        
+        return "OPEX"
+    
+    df_result['Tipo Capex 2'] = [
+        calcular_tipo_capex_2(a, mcf, mof) 
+        for a, mcf, mof in zip(df_result['AREA'], monto_capex_final, monto_opex_final)
+    ]
+    print(f"[THREAD-DF] Columna 'Tipo Capex 2' calculada")
+    
+    # ========================================================================
+    # COLUMNA 9: Tipo Capex
+    # Lógica:
+    # - Si AREA = "RECARGAS" → "RECARGAS"
+    # - Si Tipo Capex 2 = "OPEX" → "OPEX"
+    # - Si (Monto CAPEX EXT <> 0 Y Monto CAPEX ORD <> 0) → "MIXTA"
+    # - Si Monto CAPEX EXT <> 0 → "EXT"
+    # - Si no → "ORD"
+    # ========================================================================
+    def calcular_tipo_capex(row_area, row_tipo_capex_2, row_capex_ext, row_capex_ord):
+        area = str(row_area).strip().upper() if pd.notna(row_area) else ''
+        tc2 = str(row_tipo_capex_2).strip().upper() if pd.notna(row_tipo_capex_2) else ''
+        ce = float(row_capex_ext) if pd.notna(row_capex_ext) else 0
+        co = float(row_capex_ord) if pd.notna(row_capex_ord) else 0
+        
+        if area == "RECARGAS":
+            return "RECARGAS"
+        
+        if tc2 == "OPEX":
+            return "OPEX"
+        
+        if ce != 0 and co != 0:
+            return "MIXTA"
+        
+        if ce != 0:
+            return "EXT"
+        
+        return "ORD"
+    
+    df_result['Tipo Capex'] = [
+        calcular_tipo_capex(a, tc2, ce, co) 
+        for a, tc2, ce, co in zip(df_result['AREA'], df_result['Tipo Capex 2'], capex_ext, capex_ord)
+    ]
+    print(f"[THREAD-DF] Columna 'Tipo Capex' calculada")
+    
+    # ========================================================================
+    # COLUMNA 10: Monto Capex ORD 2
+    # Lógica:
+    # - Si Tipo Capex = "OPEX" o "RECARGAS" o "PRESTAMO" → 0
+    # - Si Tipo Capex = "EXT" → 0
+    # - Si Tipo Capex = "ORD" → Monto Capex Final
+    # - Sino → Monto Capex Final * (CAPEX ORD / (CAPEX ORD + CAPEX EXT))
+    # ========================================================================
+    def calcular_monto_capex_ord_2(row_tipo_capex, row_monto_capex_final, row_capex_ext, row_capex_ord):
+        tc = str(row_tipo_capex).strip().upper() if pd.notna(row_tipo_capex) else ''
+        mcf = float(row_monto_capex_final) if pd.notna(row_monto_capex_final) else 0
+        ce = float(row_capex_ext) if pd.notna(row_capex_ext) else 0
+        co = float(row_capex_ord) if pd.notna(row_capex_ord) else 0
+        
+        # Si es OPEX, RECARGAS o PRESTAMO → 0
+        if tc in ["OPEX", "RECARGAS", "PRESTAMO"]:
+            return 0
+        
+        # Si es EXT → 0
+        if tc == "EXT":
+            return 0
+        
+        # Si es ORD → Monto Capex Final
+        if tc == "ORD":
+            return mcf
+        
+        # Sino (MIXTA) → Monto Capex Final * (CAPEX ORD / (CAPEX ORD + CAPEX EXT))
+        total = co + ce
+        if total == 0:
+            return 0
+        return mcf * (co / total)
+    
+    df_result['Monto Capex ORD 2'] = [
+        calcular_monto_capex_ord_2(tc, mcf, ce, co) 
+        for tc, mcf, ce, co in zip(df_result['Tipo Capex'], monto_capex_final, capex_ext, capex_ord)
+    ]
+    print(f"[THREAD-DF] Columna 'Monto Capex ORD 2' calculada")
+    
+    # ========================================================================
+    # COLUMNA 11: Monto Capex EXT 3
+    # Lógica:
+    # - Si Tipo Capex = "OPEX" o "RECARGAS" o "PRESTAMO" → 0
+    # - Si Tipo Capex = "ORD" → 0
+    # - Si Tipo Capex = "EXT" → Monto Capex Final
+    # - Sino → Monto Capex Final * (CAPEX EXT / (CAPEX ORD + CAPEX EXT))
+    # ========================================================================
+    def calcular_monto_capex_ext_3(row_tipo_capex, row_monto_capex_final, row_capex_ext, row_capex_ord):
+        tc = str(row_tipo_capex).strip().upper() if pd.notna(row_tipo_capex) else ''
+        mcf = float(row_monto_capex_final) if pd.notna(row_monto_capex_final) else 0
+        ce = float(row_capex_ext) if pd.notna(row_capex_ext) else 0
+        co = float(row_capex_ord) if pd.notna(row_capex_ord) else 0
+        
+        # Si es OPEX, RECARGAS o PRESTAMO → 0
+        if tc in ["OPEX", "RECARGAS", "PRESTAMO"]:
+            return 0
+        
+        # Si es ORD → 0
+        if tc == "ORD":
+            return 0
+        
+        # Si es EXT → Monto Capex Final
+        if tc == "EXT":
+            return mcf
+        
+        # Sino (MIXTA) → Monto Capex Final * (CAPEX EXT / (CAPEX ORD + CAPEX EXT))
+        total = co + ce
+        if total == 0:
+            return 0
+        return mcf * (ce / total)
+    
+    df_result['Monto Capex EXT 3'] = [
+        calcular_monto_capex_ext_3(tc, mcf, ce, co) 
+        for tc, mcf, ce, co in zip(df_result['Tipo Capex'], monto_capex_final, capex_ext, capex_ord)
+    ]
+    print(f"[THREAD-DF] Columna 'Monto Capex EXT 3' calculada")
     
     # Guardar las tasas en el DataFrame para referencia
     df_result.attrs['tasa_ves_usd'] = tasa_ves_usd
@@ -813,6 +1055,169 @@ def crear_excel_con_formulas(df: pd.DataFrame, output_path: Path) -> Dict[str, A
         print(f"[THREAD-EXCEL] Columna 'Monto Opex Final' agregada")
         
         # ====================================================================
+        # CREAR HOJA "Areas" CON LA TABLA DE ÁREAS
+        # ====================================================================
+        print("[THREAD-EXCEL] Obteniendo tabla de áreas desde Google Sheets...")
+        try:
+            df_areas = get_google_sheet_data()
+            
+            # Crear hoja "Areas"
+            ws_areas = workbook.add_worksheet('Areas')
+            
+            # Escribir encabezados
+            for col_idx, col_name in enumerate(df_areas.columns):
+                ws_areas.write(0, col_idx, col_name, header_format)
+            
+            # Escribir datos
+            for row_idx, row in df_areas.iterrows():
+                for col_idx, value in enumerate(row):
+                    ws_areas.write(row_idx + 1, col_idx, value, text_format)
+            
+            # Ajustar ancho de columnas
+            for col_idx in range(len(df_areas.columns)):
+                ws_areas.set_column(col_idx, col_idx, 20)
+            
+            num_areas = len(df_areas)
+            print(f"[THREAD-EXCEL] Hoja 'Areas' creada con {num_areas} registros")
+        except Exception as e:
+            print(f"[THREAD-EXCEL] WARN: No se pudo crear hoja 'Areas': {str(e)}")
+            df_areas = pd.DataFrame()
+            num_areas = 0
+        
+        # Letras adicionales necesarias para AREA
+        proveedor_col = col_indices.get('Proveedor')
+        sucursal_col = col_indices.get('Sucursal')
+        solicitante_col = col_indices.get('Solicitante')
+        
+        proveedor_letter = indice_a_letra_excel(proveedor_col) if proveedor_col is not None else None
+        sucursal_letter = indice_a_letra_excel(sucursal_col) if sucursal_col is not None else None
+        solicitante_letter = indice_a_letra_excel(solicitante_col) if solicitante_col is not None else None
+        
+        # ====================================================================
+        # COLUMNA 10: AREA
+        # Fórmula compleja con múltiples condiciones para RECARGAS y VLOOKUP
+        # ====================================================================
+        col_area = col_formula_idx
+        col_formula_idx += 1
+        worksheet.write(0, col_area, 'AREA', header_format)
+        worksheet.set_column(col_area, col_area, 15)
+        
+        if proveedor_letter and sucursal_letter and solicitante_letter and num_areas > 0:
+            for row in range(1, num_filas + 1):
+                excel_row = row + 1
+                # Construir fórmula compleja para AREA
+                # Condiciones de RECARGAS
+                cond_digitel = f'AND({proveedor_letter}{excel_row}="CORPORACION DIGITEL, C.A.",OR({sucursal_letter}{excel_row}="POSPAGO FACTURA",{sucursal_letter}{excel_row}="PREPAGO RECARGA"))'
+                cond_netuno = f'AND({proveedor_letter}{excel_row}="NETUNO, C.A.",{sucursal_letter}{excel_row}="RECARGAS")'
+                cond_telefonica1 = f'AND({proveedor_letter}{excel_row}="TELEFÓNICA VENEZOLANA, C.A.",{sucursal_letter}{excel_row}="RECARGAS")'
+                cond_telefonica2 = f'AND({proveedor_letter}{excel_row}="TELEFONICA VENEZOLANA, C.A.",{sucursal_letter}{excel_row}="RECARGAS")'
+                cond_galaxy = f'{proveedor_letter}{excel_row}="GALAXY ENTERTAINMENT DE VENEZUELA, C.A. (SIMPLE TV )"'
+                cond_recargas_movil = f'{proveedor_letter}{excel_row}="RECARGAS MOVIL C.A"'
+                
+                formula = (
+                    f'=IF(OR({cond_digitel},{cond_netuno},{cond_telefonica1},{cond_telefonica2},{cond_galaxy},{cond_recargas_movil}),'
+                    f'"RECARGAS",'
+                    f'IF({solicitante_letter}{excel_row}=0,"SERVICIOS",'
+                    f'IFERROR(VLOOKUP({solicitante_letter}{excel_row},Areas!$A$1:$B${num_areas + 1},2,FALSE),"SERVICIOS")))'
+                )
+                worksheet.write_formula(row, col_area, formula, text_format)
+        
+        area_letter = indice_a_letra_excel(col_area)
+        print(f"[THREAD-EXCEL] Columna 'AREA' agregada")
+        
+        # ====================================================================
+        # COLUMNA 11: Tipo Capex 2
+        # Fórmula: =IF(AREA="RECARGAS","RECARGAS",IF(AND(MontoCapexFinal<>0,MontoOpexFinal<>0),"MIXTA",IF(MontoCapexFinal<>0,"CAPEX","OPEX")))
+        # ====================================================================
+        col_tipo_capex_2 = col_formula_idx
+        col_formula_idx += 1
+        worksheet.write(0, col_tipo_capex_2, 'Tipo Capex 2', header_format)
+        worksheet.set_column(col_tipo_capex_2, col_tipo_capex_2, 14)
+        
+        for row in range(1, num_filas + 1):
+            excel_row = row + 1
+            formula = (
+                f'=IF({area_letter}{excel_row}="RECARGAS","RECARGAS",'
+                f'IF(AND({monto_capex_final_letter}{excel_row}<>0,{monto_opex_final_letter}{excel_row}<>0),"MIXTA",'
+                f'IF({monto_capex_final_letter}{excel_row}<>0,"CAPEX","OPEX")))'
+            )
+            worksheet.write_formula(row, col_tipo_capex_2, formula, text_format)
+        
+        tipo_capex_2_letter = indice_a_letra_excel(col_tipo_capex_2)
+        print(f"[THREAD-EXCEL] Columna 'Tipo Capex 2' agregada")
+        
+        # ====================================================================
+        # COLUMNA 12: Tipo Capex
+        # Fórmula: =IF(AREA="RECARGAS","RECARGAS",IF(TipoCapex2="OPEX","OPEX",IF(AND(CapexExt<>0,CapexOrd<>0),"MIXTA",IF(CapexExt<>0,"EXT","ORD"))))
+        # ====================================================================
+        col_tipo_capex = col_formula_idx
+        col_formula_idx += 1
+        worksheet.write(0, col_tipo_capex, 'Tipo Capex', header_format)
+        worksheet.set_column(col_tipo_capex, col_tipo_capex, 14)
+        
+        if capex_ext_letter and capex_ord_letter:
+            for row in range(1, num_filas + 1):
+                excel_row = row + 1
+                formula = (
+                    f'=IF({area_letter}{excel_row}="RECARGAS","RECARGAS",'
+                    f'IF({tipo_capex_2_letter}{excel_row}="OPEX","OPEX",'
+                    f'IF(AND({capex_ext_letter}{excel_row}<>0,{capex_ord_letter}{excel_row}<>0),"MIXTA",'
+                    f'IF({capex_ext_letter}{excel_row}<>0,"EXT","ORD"))))'
+                )
+                worksheet.write_formula(row, col_tipo_capex, formula, text_format)
+        
+        tipo_capex_letter = indice_a_letra_excel(col_tipo_capex)
+        print(f"[THREAD-EXCEL] Columna 'Tipo Capex' agregada")
+        
+        # ====================================================================
+        # COLUMNA 13: Monto Capex ORD 2
+        # Fórmula: =IF(OR(TipoCapex="OPEX",TipoCapex="RECARGAS",TipoCapex="PRESTAMO"),0,
+        #             IF(TipoCapex="EXT",0,IF(TipoCapex="ORD",MontoCapexFinal,MontoCapexFinal*(CapexOrd/(CapexOrd+CapexExt)))))
+        # ====================================================================
+        col_monto_capex_ord_2 = col_formula_idx
+        col_formula_idx += 1
+        worksheet.write(0, col_monto_capex_ord_2, 'Monto Capex ORD 2', header_format)
+        worksheet.set_column(col_monto_capex_ord_2, col_monto_capex_ord_2, 18)
+        
+        if capex_ext_letter and capex_ord_letter:
+            for row in range(1, num_filas + 1):
+                excel_row = row + 1
+                formula = (
+                    f'=IF(OR({tipo_capex_letter}{excel_row}="OPEX",{tipo_capex_letter}{excel_row}="RECARGAS",{tipo_capex_letter}{excel_row}="PRESTAMO"),0,'
+                    f'IF({tipo_capex_letter}{excel_row}="EXT",0,'
+                    f'IF({tipo_capex_letter}{excel_row}="ORD",{monto_capex_final_letter}{excel_row},'
+                    f'{monto_capex_final_letter}{excel_row}*({capex_ord_letter}{excel_row}/({capex_ord_letter}{excel_row}+{capex_ext_letter}{excel_row})))))'
+                )
+                worksheet.write_formula(row, col_monto_capex_ord_2, formula, money_format)
+        
+        monto_capex_ord_2_letter = indice_a_letra_excel(col_monto_capex_ord_2)
+        print(f"[THREAD-EXCEL] Columna 'Monto Capex ORD 2' agregada")
+        
+        # ====================================================================
+        # COLUMNA 14: Monto Capex EXT 3
+        # Fórmula: =IF(OR(TipoCapex="OPEX",TipoCapex="RECARGAS",TipoCapex="PRESTAMO"),0,
+        #             IF(TipoCapex="ORD",0,IF(TipoCapex="EXT",MontoCapexFinal,MontoCapexFinal*(CapexExt/(CapexOrd+CapexExt)))))
+        # ====================================================================
+        col_monto_capex_ext_3 = col_formula_idx
+        col_formula_idx += 1
+        worksheet.write(0, col_monto_capex_ext_3, 'Monto Capex EXT 3', header_format)
+        worksheet.set_column(col_monto_capex_ext_3, col_monto_capex_ext_3, 18)
+        
+        if capex_ext_letter and capex_ord_letter:
+            for row in range(1, num_filas + 1):
+                excel_row = row + 1
+                formula = (
+                    f'=IF(OR({tipo_capex_letter}{excel_row}="OPEX",{tipo_capex_letter}{excel_row}="RECARGAS",{tipo_capex_letter}{excel_row}="PRESTAMO"),0,'
+                    f'IF({tipo_capex_letter}{excel_row}="ORD",0,'
+                    f'IF({tipo_capex_letter}{excel_row}="EXT",{monto_capex_final_letter}{excel_row},'
+                    f'{monto_capex_final_letter}{excel_row}*({capex_ext_letter}{excel_row}/({capex_ord_letter}{excel_row}+{capex_ext_letter}{excel_row})))))'
+                )
+                worksheet.write_formula(row, col_monto_capex_ext_3, formula, money_format)
+        
+        monto_capex_ext_3_letter = indice_a_letra_excel(col_monto_capex_ext_3)
+        print(f"[THREAD-EXCEL] Columna 'Monto Capex EXT 3' agregada")
+        
+        # ====================================================================
         # FILA DE TOTALES
         # ====================================================================
         fila_totales = num_filas + 2
@@ -838,6 +1243,14 @@ def crear_excel_con_formulas(df: pd.DataFrame, output_path: Path) -> Dict[str, A
                                f'=SUM({monto_opex_final_letter}2:{monto_opex_final_letter}{num_filas + 1})', 
                                formula_format)
         
+        # Suma para nuevas columnas (Monto Capex ORD 2, Monto Capex EXT 3)
+        worksheet.write_formula(fila_totales, col_monto_capex_ord_2, 
+                               f'=SUM({monto_capex_ord_2_letter}2:{monto_capex_ord_2_letter}{num_filas + 1})', 
+                               formula_format)
+        worksheet.write_formula(fila_totales, col_monto_capex_ext_3, 
+                               f'=SUM({monto_capex_ext_3_letter}2:{monto_capex_ext_3_letter}{num_filas + 1})', 
+                               formula_format)
+        
         # Freeze panes (fijar encabezado)
         worksheet.freeze_panes(1, 0)
         
@@ -860,9 +1273,14 @@ def crear_excel_con_formulas(df: pd.DataFrame, output_path: Path) -> Dict[str, A
             'Dia de Pago',
             'Monto Final',
             'Monto Capex Final',
-            'Monto Opex Final'
+            'Monto Opex Final',
+            'AREA',
+            'Tipo Capex 2',
+            'Tipo Capex',
+            'Monto Capex ORD 2',
+            'Monto Capex EXT 3'
         ],
-        'hoja_tasa': 'Tasa'
+        'hojas_adicionales': ['Tasa', 'Areas']
     }
 
 
